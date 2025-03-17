@@ -1,0 +1,8 @@
+name = "request-forward-worker"          # ชื่อของ Worker (ตั้งชื่ออะไรก็ได้)
+main = "src/index.js"               # ไฟล์หลักที่มี export default { async fetch() {...} }
+compatibility_date = "2023-06-01"   # ระบุวันที่ใช้งานได้ (รองรับ API ตามวัน)
+
+# ถ้าต้องการ bind ให้เรียกด้วยโดเมนของตัวเอง
+# [routes]
+#   - pattern = "example.com/*"
+#     zone_id = "<YOUR_ZONE_ID>"
