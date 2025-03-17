@@ -1,58 +1,67 @@
 export default {
   async fetch(request, env, ctx) {
-    // 1) อ่าน path segments จาก URL
-    const { pathname } = new URL(request.url);
-    // ตัวอย่าง: ถ้าเรียก https://<WORKER>/aaa/bbb/ccc
-    // จะได้ segments = ["aaa", "bbb", "ccc"]
-    const segments = pathname.slice(1).split('/').filter(Boolean);
+    // 1) ดึง path ทั้งหมด (เช่น "/https://xxx/https://yyy")
+    const url = new URL(request.url);
+    // ตัด '/' หน้าแรกออก เพื่อให้เหลือ "https://xxx/https://yyy"
+    const rawPath = url.pathname.slice(1);
 
-    // ถ้าไม่เจอ segment ใด ๆ เลย ก็ถือว่าไม่มีปลายทางให้ forward
-    if (segments.length === 0) {
+    if (!rawPath) {
       return new Response(
-        JSON.stringify({ error: 'No forwarding destinations specified in path.' }),
+        JSON.stringify({ error: 'No forwarding destinations found in path.' }),
         { status: 400, headers: { 'Content-Type': 'application/json' } }
       );
     }
 
-    // 2) อ่าน Body เดิม (ถ้ามี) เพื่อเก็บไว้ forward
+    // 2) ใช้ Regex หา Endpoint แต่ละตัวที่ขึ้นต้นด้วย http:// หรือ https://
+    //    แล้วลากยาวไปจนกว่าจะเจอ http:// / https:// ถัดไป หรือจบ string
+    //    - `g` = global match
+    //    - pattern นี้จะจับกลุ่มเป็น (http://... ) หรือ (https://... ) จนกว่าจะเจอ https?://
+    //      ถัดไป หรือจบ string
+    const pattern = /(https?:\/\/.*?)(?=https?:\/\/|$)/g;
+    const endpoints = [];
+    let match;
+    while ((match = pattern.exec(rawPath)) !== null) {
+      endpoints.push(match[1]);
+    }
+
+    if (endpoints.length === 0) {
+      return new Response(
+        JSON.stringify({
+          error: 'No valid http:// or https:// URL found in path.',
+          rawPath,
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // 3) เตรียมอ่าน body ถ้าเป็น method ที่มี body
     let requestBody = null;
     if (request.method !== 'GET' && request.method !== 'HEAD') {
-      // ใช้ arrayBuffer() เผื่อกรณีเป็นข้อมูล Binary/JSON
       requestBody = await request.arrayBuffer();
     }
 
-    // 3) เตรียม Headers สำหรับ forward
+    // 4) ก๊อป Headers และลบของไม่จำเป็น
     const forwardHeaders = new Headers(request.headers);
-    // ลบ header ที่ไม่จำเป็น หรือต้องเปลี่ยน
     forwardHeaders.delete('host');
 
-    // 4) สร้างชุด Promise สำหรับ forward ไปทุกปลายทาง
-    //    ถ้า segment ไม่ได้ระบุ protocol (http/https) ไว้ จะ default เป็น https://
-    const forwardPromises = segments.map(async (segment) => {
-      let targetURL = segment;
-      if (!/^https?:\/\//i.test(targetURL)) {
-        targetURL = 'https://' + targetURL;
-      }
+    // 5) สร้าง Promise สำหรับ forward ไปยังทุก endpoint
+    const forwardPromises = endpoints.map(async (endpoint) => {
       try {
-        // สร้าง Request ใหม่ไปยังปลายทาง
-        const forwardRequest = new Request(targetURL, {
+        const forwardRequest = new Request(endpoint, {
           method: request.method,
           headers: forwardHeaders,
           body: requestBody,
         });
-        // ยิง fetch
         await fetch(forwardRequest);
       } catch (err) {
-        // ถ้า fetch error ก็ทำแค่ log หรือจะเก็บเป็น return ค่าไว้ก็ได้
-        console.error(`Error forwarding to ${targetURL}:`, err);
+        console.error(`Error forwarding to ${endpoint}:`, err);
       }
     });
 
-    // 5) ใช้ ctx.waitUntil เพื่อให้ Promise ทั้งหมดรันเบื้องหลัง
-    //    แล้วเราตอบ 200 กลับทันที (ป้องกัน Timeout สำหรับ Webhook)
+    // 6) รันแบบ async เบื้องหลัง ไม่บล็อกการตอบ 200 (เหมาะสำหรับ Webhook)
     ctx.waitUntil(Promise.all(forwardPromises));
 
-    // ตอบกลับ 200 OK ไม่บล็อกการ forward
+    // 7) ตอบ OK ทันที
     return new Response('OK', { status: 200 });
   },
 };
