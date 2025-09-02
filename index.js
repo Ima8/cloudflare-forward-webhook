@@ -1,9 +1,8 @@
 export default {
   async fetch(request, env, ctx) {
-    // 1) ดึง path ทั้งหมด (เช่น "/https://xxx/https://yyy")
+    // 1) ดึง path ทั้งหมด (เช่น "/https://a/https://b/https://c") จากโฮสต์ forward.sable.asia
     const url = new URL(request.url);
-    // ตัด '/' หน้าแรกออก เพื่อให้เหลือ "https://xxx/https://yyy"
-    let rawPath = url.pathname.slice(1);
+    let rawPath = url.pathname.slice(1); // ตัด '/' หน้าแรก
 
     if (!rawPath) {
       return new Response(
@@ -12,29 +11,38 @@ export default {
       );
     }
 
-    // [แก้ไข] รองรับเคสที่มีการ encode "https://", "http://"
-    // เช่น https%3A%2F%2F ให้ถอดรหัสเฉพาะส่วนนั้น เพื่อไม่ไปแก้ส่วน path อื่นที่อาจตั้งใจ encode ไว้
+    // รองรับเคส encode โปรโตคอลทั้ง http:// และ https:// (เช่น https%3A%2F%2F)
     try {
       rawPath = rawPath.replace(/https?%3A%2F%2F/gi, (m) => decodeURIComponent(m));
     } catch (_) {}
 
-    // 2) ใช้ Regex หา Endpoint แต่ละตัวที่ขึ้นต้นด้วย http:// หรือ https://
-    //    แล้วลากยาวไปจนกว่าจะเจอ http:// / https:// ถัดไป หรือจบ string
-    //    - `g` = global match
-    //    - pattern นี้จะจับกลุ่มเป็น (http://... ) หรือ (https://... ) จนกว่าจะเจอ https?://
-    //      ถัดไป หรือจบ string
-    const pattern = /(https?:\/\/.*?)(?=https?:\/\/|$)/gi;
+    // 2) แยก endpoint ทีละตัว:
+    //    - ใช้ lookahead ให้ต้องมี '/' คั่นก่อน http(s):// ถัดไป หรือจบสตริง
+    //    - รองรับทั้ง http และ https (https? ครอบทั้งคู่)
+    const pattern = /(https?:\/\/.*?)(?=\/https?:\/\/|$)/gi;
     const endpoints = [];
     let match;
+
     while ((match = pattern.exec(rawPath)) !== null) {
-      // [แก้ไขเล็กน้อย] ตรวจสอบความถูกต้องของ URL ที่จับได้
+      let candidate = match[1];
+      let u;
+
+      // พยายาม parse เป็น URL; ถ้าไม่ผ่าน ลอง decode ทั้งก้อนไปอีกชั้น (กรณีทั้ง endpoint ถูก percent-encode)
       try {
-        // จะ throw ถ้าไม่ใช่ URL ถูกต้อง
-        new URL(match[1]);
-        endpoints.push(match[1]);
-      } catch (_) {
-        // ข้าม URL ที่ไม่ผ่าน validation
+        u = new URL(candidate);
+      } catch {
+        try { u = new URL(decodeURIComponent(candidate)); } catch { continue; }
       }
+
+      // ตัด '/' ปลายพาธออก เพื่อลดโอกาสที่ปลายทางอ่านพาธแล้วได้เซ็กเมนต์สุดท้ายเป็นค่าว่าง -> 'null'
+      u.pathname = u.pathname.replace(/\/+$/, '');
+
+      // ผนวก query params จาก forward.sable.asia ไปยังทุก endpoint (คงของเดิม และ append ค่าใหม่)
+      for (const [k, v] of url.searchParams) {
+        u.searchParams.append(k, v);
+      }
+
+      endpoints.push(u.toString());
     }
 
     if (endpoints.length === 0) {
@@ -47,17 +55,17 @@ export default {
       );
     }
 
-    // 3) เตรียมอ่าน body ถ้าเป็น method ที่มี body
+    // 3) เตรียม body (ส่งต่อเฉพาะเมธอดที่มีบอดี้)
     let requestBody = null;
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
+    const method = request.method.toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
       requestBody = await request.arrayBuffer();
     }
 
-    // 4) ก๊อป Headers และลบของไม่จำเป็น/เสี่ยงทำให้ปลายทาง rewrite เพี้ยน
+    // 4) คัดกรองเฮดเดอร์ออกจากต้นฉบับ เพื่อลดผลข้างเคียงเรื่อง rewrite/route ที่ปลายทาง
     const forwardHeaders = new Headers(request.headers);
-    forwardHeaders.delete('host'); // เดิมมีอยู่แล้ว
+    forwardHeaders.delete('host');
 
-    // [แก้ไขสำคัญ] ลบ hop-by-hop / proxy headers และพวก x-forwarded-* ที่อาจทำให้ปลายทางตีความ path ผิด
     for (const key of Array.from(forwardHeaders.keys())) {
       const k = key.toLowerCase();
       if (
@@ -71,6 +79,7 @@ export default {
         k === 'via' ||
         k === 'forwarded' ||
         k === 'origin' ||
+        k === 'cookie' ||
         k.startsWith('x-forwarded-') ||
         k.startsWith('cf-') ||
         k.startsWith('sec-fetch')
@@ -79,14 +88,13 @@ export default {
       }
     }
 
-    // 5) สร้าง Promise สำหรับ forward ไปยังทุก endpoint
+    // 5) ยิงไปยังทุก endpoint พร้อมกัน
     const forwardPromises = endpoints.map(async (endpoint) => {
       try {
         const forwardRequest = new Request(endpoint, {
-          method: request.method,
+          method,
           headers: forwardHeaders,
-          // [แก้ไข] clone body ต่อปลายทางแต่ละตัว ป้องกัน side-effect เวลา fetch หลายครั้ง
-          body: requestBody ? requestBody.slice(0) : undefined,
+          body: requestBody ? requestBody.slice(0) : undefined, // clone body ต่อปลายทาง
         });
         await fetch(forwardRequest);
       } catch (err) {
@@ -94,8 +102,7 @@ export default {
       }
     });
 
-    // 6) รันแบบ async เบื้องหลัง ไม่บล็อกการตอบ 200 (เหมาะสำหรับ Webhook)
-    // [แก้ไขเล็กน้อย] ใช้ allSettled กันกรณี error ใด ๆ ทำให้ promise ทั้งชุด reject
+    // 6) รันแบบ async เบื้องหลัง ไม่บล็อกการตอบ
     ctx.waitUntil(Promise.allSettled(forwardPromises));
 
     // 7) ตอบ OK ทันที
